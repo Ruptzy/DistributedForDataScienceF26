@@ -61,7 +61,7 @@ Resources:
       Handler: lambda_handler.lambda_handler
       Runtime: python3.12
       CodeUri: worker/
-      MemorySize: 256
+      MemorySize: 1024
       Timeout: 30
       Environment:
         Variables:

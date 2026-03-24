@@ -58,6 +58,7 @@ dynamodb = boto3.resource("dynamodb")
 
 RESULTS_QUEUE_URL = os.environ.get("RESULTS_QUEUE_URL", "")
 DYNAMO_TABLE_NAME = os.environ.get("DYNAMO_TABLE_NAME", "")
+table = dynamodb.Table(DYNAMO_TABLE_NAME) if DYNAMO_TABLE_NAME else None
 
 # ---------------------------------------------------------------------------
 # Scoring constants - from the assignment specification
@@ -113,8 +114,32 @@ def compute_score(bid, opportunity):
         - What if the category combination is not in RELEVANCE_MAP?
         - What if the timestamp cannot be parsed?
     """
-    # YOUR CODE HERE
-    raise NotImplementedError("Task 1: Implement compute_score")
+    bid_amount = bid.get('bid_amount')
+    if bid_amount is None or bid_amount <= 0:
+        return 0.0
+
+    content_cat = opportunity.get('content_category')
+    ad_cat = bid.get('category')
+    relevance_multiplier = RELEVANCE_MAP.get((content_cat, ad_cat), 1.0)
+
+    time_bonus = 1.0
+    timestamp_str = opportunity.get('timestamp')
+    if timestamp_str:
+        try:
+            ts = timestamp_str.replace('Z', '+00:00')
+            dt = datetime.fromisoformat(ts).astimezone(timezone.utc)
+            for start_h, end_h, bonus in TIME_WINDOWS:
+                if start_h <= dt.hour < end_h:
+                    time_bonus = bonus
+                    break
+        except Exception:
+            pass
+
+    device_type = opportunity.get('device_type')
+    device_bonus = DEVICE_BONUS.get(device_type, 1.0)
+
+    score = float(bid_amount) * relevance_multiplier * time_bonus * device_bonus
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -141,8 +166,33 @@ def select_winner(opportunity):
         - Find the highest score (the winner) and second-highest score
         - Return the result dict with all four fields
     """
-    # YOUR CODE HERE
-    raise NotImplementedError("Task 2: Implement select_winner")
+    bids = opportunity.get('bids', [])
+    if not bids:
+        return None
+
+    scored_bids = []
+    for bid in bids:
+        score = compute_score(bid, opportunity)
+        scored_bids.append((score, bid))
+
+    if not scored_bids:
+        return None
+
+    scored_bids.sort(key=lambda x: x[0], reverse=True)
+    winning_score, winning_bid = scored_bids[0]
+
+    if winning_score == 0.0:
+        return None
+
+    second_highest_score = scored_bids[1][0] if len(scored_bids) > 1 else 0.0
+    score_margin = winning_score - second_highest_score
+
+    return {
+        "winning_advertiser_id": str(winning_bid.get('advertiser_id', '')),
+        "winning_bid_amount": float(winning_bid.get('bid_amount', 0.0)),
+        "winning_score": float(winning_score),
+        "score_margin": float(score_margin)
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -182,8 +232,36 @@ def process_opportunity(opportunity):
 
     TODO: Implement this function.
     """
-    # YOUR CODE HERE
-    raise NotImplementedError("Task 3: Implement process_opportunity")
+    winner_info = select_winner(opportunity)
+    if not winner_info:
+        return None
+
+    result = {
+        "opportunity_id": opportunity.get("opportunity_id"),
+        "content_category": opportunity.get("content_category", "unknown"),
+        "winning_advertiser_id": winner_info["winning_advertiser_id"],
+        "winning_bid_amount": winner_info["winning_bid_amount"],
+        "winning_score": winner_info["winning_score"],
+        "score_margin": winner_info["score_margin"],
+        "processed_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    if RESULTS_QUEUE_URL:
+        sqs.send_message(
+            QueueUrl=RESULTS_QUEUE_URL,
+            MessageBody=json.dumps(result)
+        )
+
+    if table:
+        dynamo_item = {}
+        for key, value in result.items():
+            if isinstance(value, float):
+                dynamo_item[key] = Decimal(str(value))
+            else:
+                dynamo_item[key] = value
+        table.put_item(Item=dynamo_item)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -223,5 +301,24 @@ def lambda_handler(event, context):
 
     TODO: Implement this function.
     """
-    # YOUR CODE HERE
-    raise NotImplementedError("Task 4: Implement lambda_handler")
+    start_time = time.perf_counter()
+    records = event.get("Records", [])
+    total = len(records)
+    success_count = 0
+    failed_message_ids = []
+
+    for record in records:
+        try:
+            body = json.loads(record.get("body", "{}"))
+            process_opportunity(body)
+            success_count += 1
+        except Exception as e:
+            msg_id = record.get("messageId")
+            logger.error("Error processing record %s: %s", msg_id, e)
+            if msg_id:
+                failed_message_ids.append({"itemIdentifier": msg_id})
+
+    duration_ms = (time.perf_counter() - start_time) * 1000
+    logger.info("Batch complete: %d/%d succeeded in %.1f ms", success_count, total, duration_ms)
+
+    return {"batchItemFailures": failed_message_ids}
